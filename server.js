@@ -8,10 +8,8 @@ const app = express();
 const server = http.createServer(app);
 
 app.use(cors());
-// Serve the mobile buzzer client from the public folder
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Configure Socket.io with broad CORS for local LAN networking
 const io = new Server(server, {
     cors: {
         origin: "*",
@@ -19,53 +17,77 @@ const io = new Server(server, {
     }
 });
 
-let roomLocks = {}; // Tracks if a room's buzzer is restricted
+// roomLocks  → هل الجرس مقفول في هذه الغرفة
+// roomPlayers → قائمة اللاعبين المتصلين في كل غرفة
+let roomLocks   = {};
+let roomPlayers = {}; // { roomCode: { socketId: { name, team } } }
+
+// ── مساعد: تنظيف غرفة لو ما فيها أحد ──────────────────────────────────────
+function cleanRoomIfEmpty(roomCode) {
+    const room = io.sockets.adapter.rooms.get(roomCode);
+    if (!room || room.size === 0) {
+        delete roomLocks[roomCode];
+        delete roomPlayers[roomCode];
+        console.log(`Room ${roomCode} cleaned up (empty).`);
+    }
+}
 
 io.on('connection', (socket) => {
-    console.log('Player/Host connected:', socket.id);
+    console.log('Connected:', socket.id);
 
-    // Host (main game screen) joins
+    // ── الهوست يفتح الغرفة ────────────────────────────────────────────────
     socket.on('host-join', (roomCode) => {
         socket.join(roomCode);
-        roomLocks[roomCode] = false;
-        console.log(`Host established room: ${roomCode}`);
+        roomLocks[roomCode]   = false;
+        roomPlayers[roomCode] = roomPlayers[roomCode] || {};
+        console.log(`Host opened room: ${roomCode}`);
     });
 
-    // Mobile client joins (Updated to match user's 'join-room' event)
+    // ── لاعب يدخل الغرفة ─────────────────────────────────────────────────
     socket.on('join-room', (data) => {
         const { roomCode, name, team } = data;
+        if (!roomCode || !name) return;
+
         socket.join(roomCode);
+
+        // احفظ بيانات اللاعب
+        if (!roomPlayers[roomCode]) roomPlayers[roomCode] = {};
+        roomPlayers[roomCode][socket.id] = { name, team };
+
+        // أبلغ اللاعب بحالة الجرس الحالية
         socket.emit('joined', { buzzerLocked: roomLocks[roomCode] || false });
-        console.log(`Player ${name} (${team}) joined room: ${roomCode}`);
+
+        // أبلغ الهوست بعدد اللاعبين
+        const count = Object.keys(roomPlayers[roomCode]).length;
+        io.to(roomCode).emit('player-count', { count });
+
+        console.log(`Player "${name}" (${team}) joined room: ${roomCode} — total: ${count}`);
     });
 
-    // Mobile client press buzzer
+    // ── لاعب يضغط الجرس ──────────────────────────────────────────────────
     socket.on('buzz', (data) => {
-        // Find which room this socket belongs to if data is incomplete
-        // But the user's client already simplifies this
-        const room = Object.keys(socket.rooms).find(r => r !== socket.id);
+        const room = [...socket.rooms].find(r => r !== socket.id);
         if (!room || roomLocks[room]) return;
 
         roomLocks[room] = true;
-        
-        // Broadcast to everyone in the room (including host and players)
-        // Adding 'id' to let the buzzer know if they were the first
-        io.to(room).emit('buzzed', { 
-            id: socket.id, 
-            name: data?.name || 'مجهول', 
-            team: data?.team || 'team1' 
-        });
-        console.log(`BUZZ! in Room: ${room}`);
+
+        // استخدم البيانات المُرسلة أو ارجع للمحفوظة في roomPlayers
+        const saved = roomPlayers[room]?.[socket.id] || {};
+        const name  = data?.name  || saved.name  || 'مجهول';
+        const team  = data?.team  || saved.team  || 'team1';
+
+        io.to(room).emit('buzzed', { id: socket.id, name, team });
+        console.log(`BUZZ! "${name}" in room: ${room}`);
     });
 
-    // Free the buzzer (Updated to match user's 'reset' event)
+    // ── فك قفل الجرس (من الهوست) ─────────────────────────────────────────
     socket.on('unlock-buzzer', (roomCode) => {
         roomLocks[roomCode] = false;
         io.to(roomCode).emit('reset');
-        console.log(`Buzzer reset for room: ${roomCode}`);
+        console.log(`Buzzer unlocked in room: ${roomCode}`);
     });
 
-    // Handle team timeout
+    // ── انتهاء وقت فريق ──────────────────────────────────────────────────
     socket.on('team-timeout', (data) => {
         const { roomCode, timedOutTeam, team1Name, team2Name, isFinal } = data;
 
@@ -75,17 +97,30 @@ io.on('connection', (socket) => {
             return;
         }
 
-        const nextTeam = (timedOutTeam === 'team1') ? 'team2' : 'team1';
-        const nextTeamName = (nextTeam === 'team1') ? team1Name : team2Name;
+        const nextTeam     = timedOutTeam === 'team1' ? 'team2' : 'team1';
+        const nextTeamName = nextTeam     === 'team1' ? team1Name : team2Name;
         io.to(roomCode).emit('switch-team', { nextTeam, nextTeamName });
     });
 
+    // ── انقطاع اتصال اللاعب ──────────────────────────────────────────────
     socket.on('disconnect', () => {
-        console.log('Client disconnected:', socket.id);
+        console.log('Disconnected:', socket.id);
+
+        // احذف اللاعب من كل غرفة كان فيها
+        for (const roomCode of Object.keys(roomPlayers)) {
+            if (roomPlayers[roomCode]?.[socket.id]) {
+                delete roomPlayers[roomCode][socket.id];
+
+                const count = Object.keys(roomPlayers[roomCode]).length;
+                io.to(roomCode).emit('player-count', { count });
+
+                cleanRoomIfEmpty(roomCode);
+            }
+        }
     });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Buzzer Server running on port ${PORT}.`);
+    console.log(`Buzzer Server running on port ${PORT}`);
 });
