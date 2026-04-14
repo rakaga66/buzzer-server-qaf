@@ -633,10 +633,12 @@
 
         function initSocket() {
             if (socket && socket.connected) return Promise.resolve();
-            document.getElementById('discOverlay').style.display = 'flex';
+            if (!socket || socket.disconnected) {
+                document.getElementById('discOverlay').style.display = 'flex';
+            }
 
             return new Promise((resolve) => {
-                socket = io('https://buzzer-server-qaf.up.railway.app', { reconnectionAttempts: 5 });
+                socket = io('https://buzzer-server-qaf-production.up.railway.app', { reconnectionAttempts: 5 });
                 socket.on('connect', () => {
                     document.getElementById('discOverlay').style.display = 'none';
 
@@ -699,7 +701,7 @@
 
         function pressBuzzer() {
             if (!socket || buzzerLocked) return;
-            socket.emit('buzz');
+            socket.emit('buzz', { name: myName, team: myTeam });
             // Client side preemptive lock
             buzzerLocked = true;
             updateBuzzerUI();
