@@ -1,177 +1,126 @@
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
 const cors = require('cors');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
+
+app.use(cors());
+app.use(express.static(path.join(__dirname, 'public')));
+
+const io = new Server(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
     }
 });
 
-app.use(cors());
-app.use(express.static('public'));
+// roomLocks  → هل الجرس مقفول في هذه الغرفة
+// roomPlayers → قائمة اللاعبين المتصلين في كل غرفة
+let roomLocks   = {};
+let roomPlayers = {}; // { roomCode: { socketId: { name, team } } }
 
-// المتغيرات
-const rooms = new Map(); // { roomCode: { buzzerLocked: bool, players: [] } }
-
-// نموذج الغرفة
-function createRoom(roomCode) {
-    return {
-        roomCode,
-        buzzerLocked: false,
-        players: [],
-        lastBuzzer: null
-    };
-}
-
-// إضافة لاعب
-function addPlayer(roomCode, socket) {
-    if (!rooms.has(roomCode)) {
-        rooms.set(roomCode, createRoom(roomCode));
-    }
-    
-    const room = rooms.get(roomCode);
-    room.players.push({
-        id: socket.id,
-        name: socket.playerName,
-        team: socket.playerTeam,
-        socketId: socket.id
-    });
-}
-
-// حذف لاعب
-function removePlayer(roomCode, socketId) {
-    if (rooms.has(roomCode)) {
-        const room = rooms.get(roomCode);
-        room.players = room.players.filter(p => p.socketId !== socketId);
-        
-        if (room.players.length === 0) {
-            rooms.delete(roomCode);
-        }
+// ── مساعد: تنظيف غرفة لو ما فيها أحد ──────────────────────────────────────
+function cleanRoomIfEmpty(roomCode) {
+    const room = io.sockets.adapter.rooms.get(roomCode);
+    if (!room || room.size === 0) {
+        delete roomLocks[roomCode];
+        delete roomPlayers[roomCode];
+        console.log(`Room ${roomCode} cleaned up (empty).`);
     }
 }
 
-// Socket.io Events
 io.on('connection', (socket) => {
-    console.log(`New connection: ${socket.id}`);
+    console.log('Connected:', socket.id);
 
+    // ── الهوست يفتح الغرفة ────────────────────────────────────────────────
+    socket.on('host-join', (roomCode) => {
+        socket.join(roomCode);
+        roomLocks[roomCode]   = false;
+        roomPlayers[roomCode] = roomPlayers[roomCode] || {};
+        console.log(`Host opened room: ${roomCode}`);
+    });
+
+    // ── لاعب يدخل الغرفة ─────────────────────────────────────────────────
     socket.on('join-room', (data) => {
         const { roomCode, name, team } = data;
-        
-        if (!roomCode || !name) {
-            socket.emit('error', { message: 'Missing room code or name' });
+        if (!roomCode || !name) return;
+
+        socket.join(roomCode);
+
+        // احفظ بيانات اللاعب
+        if (!roomPlayers[roomCode]) roomPlayers[roomCode] = {};
+        roomPlayers[roomCode][socket.id] = { name, team };
+
+        // أبلغ اللاعب بحالة الجرس الحالية
+        socket.emit('joined', { buzzerLocked: roomLocks[roomCode] || false });
+
+        // أبلغ الهوست بعدد اللاعبين
+        const count = Object.keys(roomPlayers[roomCode]).length;
+        io.to(roomCode).emit('player-count', { count });
+
+        console.log(`Player "${name}" (${team}) joined room: ${roomCode} — total: ${count}`);
+    });
+
+    // ── لاعب يضغط الجرس ──────────────────────────────────────────────────
+    socket.on('buzz', (data) => {
+        const room = [...socket.rooms].find(r => r !== socket.id);
+        if (!room || roomLocks[room]) return;
+
+        roomLocks[room] = true;
+
+        // استخدم البيانات المُرسلة أو ارجع للمحفوظة في roomPlayers
+        const saved = roomPlayers[room]?.[socket.id] || {};
+        const name  = data?.name  || saved.name  || 'مجهول';
+        const team  = data?.team  || saved.team  || 'team1';
+
+        io.to(room).emit('buzzed', { id: socket.id, name, team });
+        console.log(`BUZZ! "${name}" in room: ${room}`);
+    });
+
+    // ── فك قفل الجرس (من الهوست) ─────────────────────────────────────────
+    socket.on('unlock-buzzer', (roomCode) => {
+        roomLocks[roomCode] = false;
+        io.to(roomCode).emit('reset');
+        console.log(`Buzzer unlocked in room: ${roomCode}`);
+    });
+
+    // ── انتهاء وقت فريق ──────────────────────────────────────────────────
+    socket.on('team-timeout', (data) => {
+        const { roomCode, timedOutTeam, team1Name, team2Name, isFinal } = data;
+
+        if (isFinal) {
+            roomLocks[roomCode] = false;
+            io.to(roomCode).emit('reset');
             return;
         }
 
-        // حفظ بيانات اللاعب
-        socket.playerName = name;
-        socket.playerTeam = team || 'team1';
-        socket.currentRoom = roomCode;
-
-        // الانضمام للغرفة
-        socket.join(roomCode);
-        addPlayer(roomCode, socket);
-
-        const room = rooms.get(roomCode);
-        const buzzerLocked = room ? room.buzzerLocked : false;
-
-        // إرسال تأكيد للاعب
-        socket.emit('joined', { 
-            roomCode, 
-            buzzerLocked,
-            players: room.players 
-        });
-
-        // إخبار باقي اللاعبين
-        socket.to(roomCode).emit('player-joined', {
-            name,
-            team,
-            players: room.players
-        });
-
-        console.log(`${name} joined room ${roomCode}`);
+        const nextTeam     = timedOutTeam === 'team1' ? 'team2' : 'team1';
+        const nextTeamName = nextTeam     === 'team1' ? team1Name : team2Name;
+        io.to(roomCode).emit('switch-team', { nextTeam, nextTeamName });
     });
 
-    socket.on('buzz', () => {
-        const roomCode = socket.currentRoom;
-        if (!roomCode) return;
-
-        const room = rooms.get(roomCode);
-        if (!room || room.buzzerLocked) return;
-
-        // قفل الجرس
-        room.buzzerLocked = true;
-        room.lastBuzzer = {
-            id: socket.id,
-            name: socket.playerName,
-            team: socket.playerTeam,
-            time: new Date()
-        };
-
-        // إخبار جميع اللاعبين
-        io.to(roomCode).emit('buzzed', {
-            id: socket.id,
-            name: socket.playerName,
-            team: socket.playerTeam
-        });
-
-        console.log(`${socket.playerName} buzzed in room ${roomCode}`);
-    });
-
-    socket.on('reset', () => {
-        const roomCode = socket.currentRoom;
-        if (!roomCode) return;
-
-        const room = rooms.get(roomCode);
-        if (!room) return;
-
-        // فتح الجرس
-        room.buzzerLocked = false;
-        room.lastBuzzer = null;
-
-        // إخبار الجميع
-        io.to(roomCode).emit('reset');
-        console.log(`Buzzer reset in room ${roomCode}`);
-    });
-
+    // ── انقطاع اتصال اللاعب ──────────────────────────────────────────────
     socket.on('disconnect', () => {
-        const roomCode = socket.currentRoom;
-        if (roomCode) {
-            removePlayer(roomCode, socket.id);
-            io.to(roomCode).emit('player-left', {
-                name: socket.playerName,
-                players: rooms.get(roomCode)?.players || []
-            });
+        console.log('Disconnected:', socket.id);
+
+        // احذف اللاعب من كل غرفة كان فيها
+        for (const roomCode of Object.keys(roomPlayers)) {
+            if (roomPlayers[roomCode]?.[socket.id]) {
+                delete roomPlayers[roomCode][socket.id];
+
+                const count = Object.keys(roomPlayers[roomCode]).length;
+                io.to(roomCode).emit('player-count', { count });
+
+                cleanRoomIfEmpty(roomCode);
+            }
         }
-        console.log(`${socket.playerName} disconnected from ${roomCode}`);
-    });
-
-    socket.on('disconnect-announce', () => {
-        socket.disconnect();
     });
 });
 
-// Routes
-app.get('/health', (req, res) => {
-    res.json({ status: 'Server is running', timestamp: new Date() });
-});
-
-app.get('/rooms', (req, res) => {
-    const roomList = Array.from(rooms.entries()).map(([code, room]) => ({
-        roomCode: code,
-        playerCount: room.players.length,
-        buzzerLocked: room.buzzerLocked
-    }));
-    res.json(roomList);
-});
-
-// Start Server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🎮 Buzzer Server running on port ${PORT}`);
-    console.log(`Health check: http://localhost:${PORT}/health`);
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Buzzer Server running on port ${PORT}`);
 });
