@@ -567,56 +567,146 @@
     </div>
 
     <!-- Socket.io -->
-    <script src="https://buzzer-server-qaf.up.railway.app/socket.io/socket.io.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
     <script>
-        let socket;
+        let socket = null;
+        let socketReady = false;
+        let pendingJoin = null; // يحفظ بيانات joinRoom لو الـ socket لم يتصل بعد
+
         let currentRoom = '';
         let myName = '';
         let myTeam = 'team1';
         let buzzerLocked = false;
 
-        // أسماء الفرق من الرابط
         let team1Name = 'الفريق الأول';
         let team2Name = 'الفريق الثاني';
 
-        // قراءة بيانات من الرابط عند التحميل
+        // ── بناء الـ socket مرة وحدة عند تحميل الصفحة ─────────────────────
+        function buildSocket() {
+            if (socket) return;
+
+            socket = io('https://buzzer-server-qaf-production.up.railway.app', {
+                reconnectionAttempts: 10,
+                reconnectionDelay: 1500
+            });
+
+            socket.on('connect', () => {
+                socketReady = true;
+                document.getElementById('discOverlay').style.display = 'none';
+                console.log('Socket connected:', socket.id);
+
+                // لو كان في طلب دخول معلق → نفّذه الحين
+                if (pendingJoin) {
+                    doJoin(pendingJoin.rc, pendingJoin.nm, pendingJoin.team);
+                    pendingJoin = null;
+                }
+            });
+
+            socket.on('disconnect', () => {
+                socketReady = false;
+                document.getElementById('discOverlay').style.display = 'flex';
+            });
+
+            socket.on('connect_error', () => {
+                showToast('❌ تعذر الاتصال بالخادم', true);
+            });
+
+            socket.on('buzzed', onBuzzed);
+            socket.on('reset', onReset);
+        }
+
+        // ── قراءة URL عند التحميل ───────────────────────────────────────────
         window.addEventListener('DOMContentLoaded', () => {
             const urlParams = new URLSearchParams(window.location.search);
-
             const roomFromUrl = urlParams.get('room');
             const nameFromUrl = urlParams.get('name');
-            const teamFromUrl = urlParams.get('team'); // team1 أو team2
+            const teamFromUrl = urlParams.get('team');
             const t1 = urlParams.get('team1');
             const t2 = urlParams.get('team2');
 
-            // تحديث أسماء الفرق لو موجودة في الرابط
             if (t1) team1Name = t1;
             if (t2) team2Name = t2;
 
-            // تحديث أزرار اختيار الفريق بالأسماء الحقيقية
             document.querySelector('.team-opt[data-team="team1"]').textContent = team1Name + ' 🟠';
             document.querySelector('.team-opt[data-team="team2"]').textContent = team2Name + ' 🟣';
 
-            // تعبئة الحقول تلقائياً
             if (roomFromUrl) {
                 document.getElementById('roomInput').value = roomFromUrl.toUpperCase();
-                document.getElementById('roomCodeGrp').style.display = 'none'; // إخفاء حقل الجلسة
+                document.getElementById('roomCodeGrp').style.display = 'none';
             }
+            if (nameFromUrl) document.getElementById('nameInput').value = nameFromUrl;
+            if (teamFromUrl === 'team1' || teamFromUrl === 'team2') selectTeam(teamFromUrl);
 
-            if (nameFromUrl) {
-                document.getElementById('nameInput').value = nameFromUrl;
-            }
+            // ابدأ الاتصال فوراً في الخلفية
+            buildSocket();
 
-            if (teamFromUrl === 'team1' || teamFromUrl === 'team2') {
-                selectTeam(teamFromUrl);
-            }
-
-            // لو كل البيانات موجودة → دخول تلقائي مباشر
+            // لو كل البيانات موجودة → دخول تلقائي بعد ما يتصل
             if (roomFromUrl && nameFromUrl && teamFromUrl) {
-                setTimeout(() => joinRoom(), 300);
+                pendingJoin = {
+                    rc: roomFromUrl.toUpperCase(),
+                    nm: nameFromUrl,
+                    team: teamFromUrl
+                };
+                // لو اتصل قبل ما نسجل pendingJoin، نفذ مباشرة
+                setTimeout(() => {
+                    if (socketReady && pendingJoin) {
+                        doJoin(pendingJoin.rc, pendingJoin.nm, pendingJoin.team);
+                        pendingJoin = null;
+                    }
+                }, 2000);
             }
         });
 
+        // ── دالة الدخول الفعلية ─────────────────────────────────────────────
+        function doJoin(rc, nm, team) {
+            currentRoom = rc;
+            myName = nm;
+            myTeam = team;
+
+            socket.once('joined', (data) => {
+                document.getElementById('loginScreen').style.display = 'none';
+                document.getElementById('mainScreen').style.display = 'flex';
+
+                document.getElementById('displayRoomCode').textContent = 'جلسة ' + currentRoom;
+                document.getElementById('displayMyName').textContent = myName;
+
+                const isT1 = (myTeam === 'team1');
+                document.getElementById('displayMyTeamName').textContent = isT1 ? team1Name : team2Name;
+                document.getElementById('displayMyTeamDot').style.background = isT1 ? 'var(--orange)' : '#ba8fed';
+
+                const bBg = document.getElementById('buzzerBg');
+                if (isT1) bBg.classList.remove('team2');
+                else bBg.classList.add('team2');
+
+                buzzerLocked = data.buzzerLocked;
+                updateBuzzerUI();
+
+                if ('vibrate' in navigator) navigator.vibrate(50);
+            });
+
+            socket.emit('join-room', { roomCode: rc, name: nm, team: team });
+        }
+
+        // ── دخول يدوي (زر "دخول الجرس") ───────────────────────────────────
+        function joinRoom() {
+            const rc = document.getElementById('roomInput').value.trim().toUpperCase();
+            const nm = document.getElementById('nameInput').value.trim();
+
+            if (!rc) return showToast('⚠️ أدخل كود الجلسة أولاً', true);
+            if (!nm) return showToast('⚠️ يرجى إدخال اسمك', true);
+
+            if (!socketReady) {
+                // الـ socket لسا ما اتصل → احفظ وانتظر
+                pendingJoin = { rc, nm, team: myTeam };
+                showToast('⏳ جاري الاتصال...', false);
+                buildSocket(); // تأكد إن الـ socket شغّال
+                return;
+            }
+
+            doJoin(rc, nm, myTeam);
+        }
+
+        // ── باقي الدوال ────────────────────────────────────────────────────
         function showToast(msg, isError = false) {
             const t = document.getElementById('toast');
             t.textContent = msg;
@@ -631,91 +721,23 @@
             document.querySelector(`.team-opt[data-team="${t}"]`).classList.add('active');
         }
 
-        function initSocket() {
-            if (socket && socket.connected) return Promise.resolve();
-            document.getElementById('discOverlay').style.display = 'flex';
-
-            return new Promise((resolve) => {
-                socket = io('https://buzzer-server-qaf.up.railway.app', { reconnectionAttempts: 5 });
-                socket.on('connect', () => {
-                    document.getElementById('discOverlay').style.display = 'none';
-
-                    // Register standard listeners if not already
-                    socket.off('buzzed').on('buzzed', onBuzzed);
-                    socket.off('reset').on('reset', onReset);
-                    socket.off('disconnect').on('disconnect', () => {
-                        document.getElementById('discOverlay').style.display = 'flex';
-                    });
-
-                    resolve();
-                });
-
-                socket.on('connect_error', () => {
-                    showToast('❌ تعذر الاتصال بالخادم', true);
-                });
-            });
-        }
-
-        async function joinRoom() {
-            const rc = document.getElementById('roomInput').value.trim().toUpperCase();
-            const nm = document.getElementById('nameInput').value.trim();
-
-            if (!rc) return showToast('⚠️ أدخل كود الجلسة أولاً', true);
-            if (!nm) return showToast('⚠️ يرجى إدخال اسمك', true);
-
-            currentRoom = rc;
-            myName = nm;
-
-            // Connect if needed
-            await initSocket();
-
-            // Setup Joined Listener
-            socket.once('joined', (data) => {
-                // Success
-                document.getElementById('loginScreen').style.display = 'none';
-                document.getElementById('mainScreen').style.display = 'flex';
-
-                // Build UI
-                document.getElementById('displayRoomCode').textContent = 'جلسة ' + currentRoom;
-                document.getElementById('displayMyName').textContent = myName;
-
-                const isT1 = (myTeam === 'team1');
-                document.getElementById('displayMyTeamName').textContent = isT1 ? team1Name : team2Name;
-                document.getElementById('displayMyTeamDot').style.background = isT1 ? 'var(--orange)' : '#ba8fed'; // Matching purplish 
-
-                const bBg = document.getElementById('buzzerBg');
-                if (isT1) bBg.classList.remove('team2');
-                else bBg.classList.add('team2');
-
-                // Apply current lock state
-                buzzerLocked = data.buzzerLocked;
-                updateBuzzerUI();
-
-                if ("vibrate" in navigator) navigator.vibrate(50);
-            });
-
-            socket.emit('join-room', { roomCode: currentRoom, name: myName, team: myTeam });
-        }
-
         function pressBuzzer() {
-            if (!socket || buzzerLocked) return;
-            socket.emit('buzz');
-            // Client side preemptive lock
+            if (!socket || !socketReady || buzzerLocked) return;
+            socket.emit('buzz', { name: myName, team: myTeam });
             buzzerLocked = true;
             updateBuzzerUI();
-            if ("vibrate" in navigator) navigator.vibrate([100, 50, 100]);
+            if ('vibrate' in navigator) navigator.vibrate([100, 50, 100]);
         }
 
         function onBuzzed(data) {
             buzzerLocked = true;
             updateBuzzerUI();
-
             if (data.id === socket.id) {
                 document.getElementById('buzzerSub').textContent = 'انت الأسرع! ✅';
                 showToast('🎉 أنت أول من ضغط!');
             } else {
                 document.getElementById('buzzerSub').textContent = 'سبقك ' + data.name;
-                if ("vibrate" in navigator) navigator.vibrate(200);
+                if ('vibrate' in navigator) navigator.vibrate(200);
             }
         }
 
@@ -724,7 +746,7 @@
             updateBuzzerUI();
             document.getElementById('buzzerSub').textContent = 'جاهز';
             showToast('✅ تم فتح الجرس!');
-            if ("vibrate" in navigator) navigator.vibrate(50);
+            if ('vibrate' in navigator) navigator.vibrate(50);
         }
 
         function updateBuzzerUI() {
